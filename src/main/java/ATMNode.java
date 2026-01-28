@@ -182,11 +182,21 @@ public class ATMNode {
      * Invia il token al nodo successore nell'anello logico
      */
     private void sendToken(String token) throws Exception {
-        Socket socket = new Socket("localhost", nextPort);
-        PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
-        out.println(token);
-        socket.close();
-        log("Inoltrato TOKEN");
+        while (true) {
+            try {
+                Socket socket = new Socket("localhost", nextPort);
+                PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
+                out.println(token);
+                socket.close();
+                log("Inoltrato TOKEN");
+                break;
+            } catch (IOException e) {
+                log("Successore non disponibile, ritento...");
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException ignored) {}
+            }
+        }
     }
 
     /**
