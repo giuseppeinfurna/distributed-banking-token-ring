@@ -5,38 +5,50 @@ import java.util.*;
 /**
  * ATMNode rappresenta un nodo (ATM) di un sistema bancario distribuito
  * che utilizza l'algoritmo Token Ring per garantire la mutua esclusione.
+ *
+ * Ogni nodo:
+ * - è un processo indipendente
+ * - comunica esclusivamente tramite messaggi TCP
+ * - accede alla risorsa condivisa (saldo) solo se in possesso del token
  */
 public class ATMNode {
 
-    // Identificatore logico del nodo (ATM1, ATM2, ...)
+    // Identificatore logico del nodo (1..4)
     private int id;
 
-    // Porta locale su cui il nodo resta in ascolto
+    // Porta TCP su cui il nodo resta in ascolto
     private int myPort;
 
-    // Porta del nodo successore nell'anello logico
+    // Porta TCP del nodo successore nell’anello logico
     private int nextPort;
 
     // Indica se il nodo ha una transazione da eseguire
     private boolean hasPendingTransaction = false;
 
-    // Tipo di transazione (DEPOSIT o WITHDRAW)
+    // Tipo di transazione associata al nodo
     private String transactionType = "";
 
     // Importo della transazione
     private int amount = 0;
 
-    // Timeout massimo di attesa del token (in millisecondi)
+    // Timeout massimo di attesa del token (ms)
     private static final int TIMEOUT = 8000;
 
-    // Timestamp dell’ultima ricezione del token
+    // Istante dell’ultima ricezione valida del token
     private long lastTokenTime = System.currentTimeMillis();
 
-    // Simula il crash del nodo (fail-stop)
+    // Simula il crash del nodo (modello fail-stop)
     private boolean crashed = false;
 
-    // Flag che indica la ricezione del token di terminazione
+    // Indica la ricezione di un token di terminazione
     private boolean stop = false;
+
+    // Indica che l’anello è stato inizializzato correttamente
+    private boolean ringReady = false;
+
+    // Indica che il token è stato inviato ma non ancora ricevuto
+    // Serve per evitare rigenerazioni spurie durante la trasmissione
+    private volatile boolean tokenInTransit = false;
 
     /**
      * Costruttore del nodo ATM
@@ -49,8 +61,9 @@ public class ATMNode {
     }
 
     /**
-     * Inizializza una transazione predefinita per alcuni nodi,
-     * usata per la dimostrazione del sistema.
+     * Inizializza una transazione predefinita per alcuni nodi.
+     * Questa scelta è puramente dimostrativa e serve a rendere
+     * osservabile il comportamento della mutua esclusione.
      */
     private void initTransaction() {
         if (id == 2) {
@@ -69,99 +82,116 @@ public class ATMNode {
     }
 
     /**
-     * Avvia il server socket del nodo e resta in ascolto
-     * dei token provenienti dal predecessore.
+     * Avvia il server socket del nodo.
+     * Il nodo resta in ascolto dei token provenienti dal predecessore
+     * e delega la gestione del token al metodo handleToken().
      */
     public void start() throws Exception {
         ServerSocket serverSocket = new ServerSocket(myPort);
 
-        // Timeout per evitare blocchi indefiniti su accept()
+        // Timeout su accept() per evitare blocchi indefiniti
         serverSocket.setSoTimeout(5000);
 
         log("In ascolto sulla porta " + myPort);
 
-        // Thread separato che monitora la perdita del token
+        // Thread separato che monitora l’eventuale perdita del token
         new Thread(this::monitorToken).start();
 
-        // Ciclo principale di ricezione del token
+        // Ciclo principale di ricezione dei token
         while (true) {
             try {
                 Socket socket = serverSocket.accept();
-                BufferedReader in = new BufferedReader(
-                        new InputStreamReader(socket.getInputStream()));
+                BufferedReader in =
+                        new BufferedReader(new InputStreamReader(socket.getInputStream()));
                 String token = in.readLine();
                 socket.close();
                 handleToken(token);
             } catch (SocketTimeoutException ignored) {
-                // Timeout usato solo per permettere controlli periodici
+                // Usato solo per permettere il controllo periodico del timeout
             }
         }
     }
 
     /**
-     * Thread di monitoraggio che rileva la perdita del token.
-     * Solo ATM1 può rigenerare il token in caso di timeout.
+     * Thread di monitoraggio del token.
+     *
+     * SOLO il nodo ATM1 può rigenerare il token e solo se:
+     * - l’anello è considerato stabile (ringReady)
+     * - il token non è in transito
+     * - il timeout è realmente scaduto
+     *
+     * Questo evita la creazione di token duplicati.
      */
     private void monitorToken() {
         while (true) {
             long tokenTime = System.currentTimeMillis() - lastTokenTime;
 
-            // Rigenerazione del token in caso di perdita
-            if (!crashed && tokenTime > TIMEOUT && id == 1) {
-                log("Timeout scaduto! Rigenero il token");
+            if (!crashed && id == 1 && ringReady &&
+                !tokenInTransit && tokenTime > TIMEOUT) {
+
+                log("Timeout reale! Rigenero il token");
                 try {
                     sendToken("TOKEN:1:1000");
-                } catch (Exception e) {
-                    // Ignorato: simulazione ambiente semplice
-                }
+                } catch (Exception ignored) {}
                 lastTokenTime = System.currentTimeMillis();
             }
 
             try {
-                Thread.sleep(1000);
-            } catch (InterruptedException e) {
-            }
+                Thread.sleep(2000);
+            } catch (InterruptedException ignored) {}
         }
     }
 
     /**
      * Gestisce il token ricevuto:
-     * - esegue la transazione (se presente)
-     * - aggiorna il saldo
-     * - inoltra il token
-     * - gestisce la terminazione distribuita
+     * - aggiorna il tempo di ricezione
+     * - esegue la sezione critica (se presente)
+     * - rileva la terminazione dell’anello
+     * - inoltra il token al successore
      */
     private void handleToken(String token) throws Exception {
 
-        // Se il nodo è crashato, ignora il token
+        // Nodo crashato: ignora ogni messaggio
         if (crashed)
             return;
 
-        // Aggiorna il tempo di ricezione del token
+        // Se il token ritorna ad ATM1, non è più in transito
+        if (id == 1) {
+            tokenInTransit = false;
+        }
+
+        // Aggiorna il timestamp di ricezione
         lastTokenTime = System.currentTimeMillis();
 
         // Parsing del token
         String[] parts = token.split(":");
-        int tokenId = Integer.parseInt(parts[1]);
+        int origin = Integer.parseInt(parts[1]);
         int balance = Integer.parseInt(parts[2]);
 
-        // Controllo presenza flag STOP
+        // Verifica presenza del flag di terminazione
         stop = parts.length == 4 && parts[3].equals("STOP");
 
         /**
-         * Condizione di terminazione:
-         * - il token ritorna ad ATM1 dopo un giro completo
-         * - oppure il token contiene il flag STOP
+         * Terminazione distribuita:
+         * - SOLO ATM1 può rilevare il completamento dell’anello
+         * - Il token mantiene invariato il nodo di origine
          */
-        if ((id == 1 && tokenId > 1) || stop) {
+        if (id == 1 && origin == 1 && !stop) {
             log("Token Ring Completato. Invio STOP.");
-            sendToken("TOKEN:" + tokenId + ":" + balance + ":STOP");
+            sendToken("TOKEN:" + origin + ":" + balance + ":STOP");
             System.exit(0);
         }
 
-        log("Ricevuto TOKEN da id=" + tokenId + " saldo=" + balance);
+        // I nodi non originatori propagano semplicemente lo STOP
+        if (stop) {
+            log("Ricevuto STOP. Terminazione.");
+            sendToken("TOKEN:" + origin + ":" + balance + ":STOP");
+            System.exit(0);
+        }
 
-        // Sezione critica: esecuzione della transazione
+        log("Ricevuto TOKEN da origin=" + origin + " saldo=" + balance);
+
+        // ===== SEZIONE CRITICA =====
         if (hasPendingTransaction) {
             log("Inizio transazione: " + transactionType + " " + amount);
 
@@ -173,13 +203,16 @@ public class ATMNode {
             log("Fine transazione | Nuovo saldo=" + balance);
             hasPendingTransaction = false;
         }
+        // ===========================
 
         // Inoltro del token al nodo successore
-        sendToken("TOKEN:" + (tokenId + 1) + ":" + balance);
+        sendToken("TOKEN:" + origin + ":" + balance);
     }
 
     /**
-     * Invia il token al nodo successore nell'anello logico
+     * Invia il token al nodo successore.
+     * In caso di indisponibilità del successore, il nodo ritenta
+     * periodicamente evitando la perdita del token.
      */
     private void sendToken(String token) throws Exception {
         while (true) {
@@ -188,12 +221,19 @@ public class ATMNode {
                 PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
                 out.println(token);
                 socket.close();
+
                 log("Inoltrato TOKEN");
+
+                // ATM1 marca il token come "in transito"
+                if (id == 1) {
+                    tokenInTransit = true;
+                }
                 break;
+
             } catch (IOException e) {
                 log("Successore non disponibile, ritento...");
                 try {
-                    Thread.sleep(1000);
+                    Thread.sleep(2000);
                 } catch (InterruptedException ignored) {}
             }
         }
@@ -208,9 +248,9 @@ public class ATMNode {
 
     /**
      * Metodo main:
-     * - crea il nodo
-     * - avvia il server in un thread separato
-     * - ATM1 inizializza il token
+     * - inizializza il nodo
+     * - avvia il server
+     * - ATM1 inizializza il token dopo il bootstrap
      */
     public static void main(String[] args) throws Exception {
         int id = Integer.parseInt(args[0]);
@@ -230,9 +270,10 @@ public class ATMNode {
             }
         }).start();
 
-        // ATM1 crea il token iniziale
+        // ATM1 crea il token iniziale dopo il bootstrap dell’anello
         if (id == 1 && !crash) {
-            Thread.sleep(2000);
+            Thread.sleep(8000);
+            node.ringReady = true;
             node.log("Creato TOKEN iniziale");
             node.sendToken("TOKEN:1:1000");
         }
